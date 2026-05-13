@@ -1,20 +1,14 @@
 """
 installer/main.py — Точка входа установщика VLESS Ultimate.
 
-Этот модуль:
-1. Инициализирует среду (директории, логирование)
-2. Проверяет root и зависимости
-3. Запускает главное меню
+Инициализирует среду, проверяет root, устанавливает базовые зависимости
+и запускает главное меню из cli/menu.py.
 
-Бизнес-логика установки НЕ живёт здесь — она в соответствующих модулях:
-  - Установка пакетов     → core/system.py
-  - Xray                  → services/xray.py
-  - Nginx                 → services/nginx.py
-  - Конфиги               → config_builders/
-  - Диагностика           → diagnostics/
-  - Меню                  → cli/menu.py (обёртка вокруг оригинального main_menu)
-
-Для полноценного рефакторинга меню (27 000+ строк кода) — см. ARCHITECTURE.md.
+Бизнес-логика живёт в:
+  - services/       — установка и управление сервисами
+  - config_builders/ — сборка конфигов Xray/Nginx
+  - diagnostics/    — проверки здоровья
+  - cli/menu.py     — интерактивное меню
 """
 
 from __future__ import annotations
@@ -29,19 +23,15 @@ from pathlib import Path
 
 def _bootstrap() -> None:
     """
-    Минимальная инициализация до загрузки всех модулей:
-    - monkey-patch input() для безопасного ввода в нестандартных терминалах
-    - создание базовых директорий
+    Минимальная патч-инициализация до загрузки модулей:
+    переопределяет input() для безопасной работы в нестандартных терминалах,
+    покрывает все места вызова input() в проекте разом.
     """
     import builtins as _builtins
 
     _orig_input = _builtins.input
 
     def _safe_input(prompt: str = "") -> str:
-        """
-        Защита от UnicodeDecodeError при чтении ввода.
-        Monkey-patches input() глобально — покрывает все 277 мест вызова.
-        """
         try:
             sys.stdout.write(prompt)
             sys.stdout.flush()
@@ -74,6 +64,7 @@ from installer.core.system import (
 )
 from installer.core.state import InstallerState
 from installer.cli.banner import print_banner
+from installer.cli.menu import main_menu, ensure_startup_dependencies
 
 
 _state_ref: InstallerState | None = None
@@ -81,13 +72,12 @@ _state_ref: InstallerState | None = None
 
 def _on_exit() -> None:
     """
-    EXIT TRAP: при аварийном завершении установки:
-    - открывает SSH (на случай если UFW был настроен)
-    - останавливает Xray/Nginx если они были запущены частично
+    EXIT TRAP: при аварийном завершении во время установки:
+    - гарантирует открытый SSH-порт в UFW
+    - останавливает частично поднятые сервисы
     - показывает путь к логу
 
-    Не срабатывает если установка завершилась успешно (progress.completed=True)
-    или если пользователь просто вышел из меню (progress.started=False).
+    Молчит если установка завершилась успешно или пользователь просто вышел.
     """
     if _state_ref is None:
         return
@@ -120,14 +110,11 @@ atexit.register(_on_exit)
 
 def run() -> None:
     """
-    Запускает установщик:
-    1. Инициализация среды и логирования
-    2. Проверка root
-    3. Установка базовых зависимостей
-    4. Главное меню
-
-    Перехватывает FileNotFoundError (отсутствие пакетов) и пытается
-    восстановить работоспособность автоматически.
+    Главный поток запуска:
+    1. Создаёт служебные директории и настраивает логирование
+    2. Проверяет root
+    3. Устанавливает базовые зависимости (curl, unzip, openssl…)
+    4. Показывает баннер и запускает главное меню
     """
     global _state_ref
 
@@ -149,7 +136,7 @@ def run() -> None:
         from installer.core.logging import die
         die(f"Запустите от root: sudo python3 {sys.argv[0]}")
 
-    _ensure_startup_dependencies(state)
+    ensure_startup_dependencies(state.pkg_mgr)
 
     print_banner()
     print()
@@ -165,32 +152,12 @@ def run() -> None:
     _run_main_loop(state)
 
 
-def _ensure_startup_dependencies(state: InstallerState) -> None:
-    """
-    Проверяет и устанавливает базовые зависимости.
-    Делегирует оригинальному ensure_startup_dependencies() из install.py
-    через legacy-мост до завершения полного рефакторинга.
-    """
-    try:
-        import importlib.util, sys as _sys
-        _legacy = _get_legacy_module()
-        if _legacy:
-            _legacy.ensure_startup_dependencies()
-    except Exception as e:
-        log_to_file("WARN", f"ensure_startup_dependencies: {e}")
-
-
 def _run_main_loop(state: InstallerState) -> None:
     """
-    Главный цикл с умным восстановлением при FileNotFoundError.
-    Максимум MAX_RETRIES попыток.
+    Запускает главное меню с авто-восстановлением при FileNotFoundError.
+    При падении с FileNotFoundError пробует установить недостающий пакет
+    и повторяет запуск (до MAX_RETRIES раз).
     """
-    _legacy = _get_legacy_module()
-    if _legacy is None:
-        from installer.core.logging import die
-        die("Не удалось загрузить модуль установщика")
-        return
-
     checkpoint_file = STATE_DIR / "checkpoint.json"
 
     for attempt in range(MAX_RETRIES + 1):
@@ -208,7 +175,7 @@ def _run_main_loop(state: InstallerState) -> None:
             except Exception:
                 pass
 
-            _legacy.main_menu()
+            main_menu(state)
             checkpoint_file.unlink(missing_ok=True)
             break
 
@@ -220,8 +187,7 @@ def _run_main_loop(state: InstallerState) -> None:
             sys.exit(0)
 
         except FileNotFoundError as fnf:
-            recovered = _legacy._smart_recover(fnf)
-            if not recovered:
+            if not _smart_recover(fnf, state.pkg_mgr):
                 print(f"\033[0;31mВосстановление невозможно. Скрипт остановлен.\033[0m")
                 print(f"\033[2mЛог: {LOG_FILE}\033[0m")
                 sys.exit(1)
@@ -243,132 +209,128 @@ def _run_main_loop(state: InstallerState) -> None:
         sys.exit(1)
 
 
-_legacy_module = None
-_legacy_loaded = False
+_BINARY_TO_PACKAGE: dict[str, str] = {
+    "curl":       "curl",
+    "wget":       "wget",
+    "unzip":      "unzip",
+    "openssl":    "openssl",
+    "dig":        "dnsutils",
+    "nginx":      "nginx",
+    "certbot":    "certbot",
+    "fail2ban":   "fail2ban",
+    "ufw":        "ufw",
+    "jq":         "jq",
+    "systemctl":  "systemd",
+    "qrencode":   "qrencode",
+}
 
 
-def _get_legacy_module():
+def _smart_recover(fnf: FileNotFoundError, pkg_mgr: str) -> bool:
     """
-    Загружает оригинальный install.py как модуль для вызова ещё не
-    перенесённых функций (main_menu, _smart_recover, ensure_startup_dependencies...).
+    При FileNotFoundError пытается определить недостающий пакет по имени
+    бинарника и установить его.
 
-    По мере завершения рефакторинга этот мост будет удаляться по частям.
+    Returns:
+        True если пакет установлен, False если восстановление невозможно.
     """
-    global _legacy_module, _legacy_loaded
-    if _legacy_loaded:
-        return _legacy_module
+    import shutil
 
-    _legacy_loaded = True
-    import importlib.util
+    missing_bin = Path(str(fnf)).name
+    package = _BINARY_TO_PACKAGE.get(missing_bin)
+    if not package:
+        log_to_file("WARN", f"_smart_recover: неизвестный бинарник {missing_bin!r}")
+        return False
 
-    candidates = [
-        Path(__file__).parent.parent / "install.py",
-        Path(__file__).parent.parent / "install (2).py",
-        Path("/opt/vless-ultimate/install.py"),
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            try:
-                spec = importlib.util.spec_from_file_location("_vless_legacy", candidate)
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                _legacy_module = mod
-                log_to_file("INFO", f"Legacy-модуль загружен из {candidate}")
-                return mod
-            except Exception as e:
-                log_to_file("WARN", f"Не удалось загрузить {candidate}: {e}")
+    if shutil.which(missing_bin):
+        log_to_file("WARN", f"_smart_recover: {missing_bin} уже в PATH, восстановление не нужно")
+        return False
 
-    log_to_file("ERROR", "Legacy install.py не найден")
-    return None
+    info(f"Отсутствует {missing_bin!r}, устанавливаю пакет {package!r}...")
+    log_to_file("RECOVER", f"installing {package} for missing {missing_bin}")
+
+    from installer.core.shell import run
+    from installer.core.system import wait_apt_lock
+
+    if pkg_mgr in ("apt-get", "apt"):
+        wait_apt_lock()
+        r = run(
+            ["apt-get", "install", "-y", "-q", "--no-install-recommends", package],
+            env={"DEBIAN_FRONTEND": "noninteractive"},
+            check=False, quiet=True,
+        )
+        return r.returncode == 0
+    elif pkg_mgr == "dnf":
+        r = run(["dnf", "install", "-y", package], check=False, quiet=True)
+        return r.returncode == 0
+
+    return False
 
 
 def handle_cli_args() -> bool:
     """
-    Обрабатывает специальные аргументы командной строки (cron-задачи и т.д.).
+    Обрабатывает специальные аргументы командной строки (cron-задачи).
     Возвращает True если аргумент обработан и основной запуск не нужен.
     """
     if "--status" in sys.argv:
         _init_quick()
-        legacy = _get_legacy_module()
-        if legacy:
-            legacy.do_quick_status()
+        _do_quick_status()
         return True
 
-    if "--smart-balance" in sys.argv:
+    if "--backup" in sys.argv:
         _init_quick()
-        legacy = _get_legacy_module()
-        if legacy and not legacy._awg_guard_cron("SmartBalancer"):
-            legacy._smart_balancer_run_once()
+        from installer.core.backup import create_backup
+        ts = create_backup()
+        print(f"Backup создан: {ts}")
         return True
 
-    if "--autoban" in sys.argv:
+    if "--diagnostics" in sys.argv:
         _init_quick()
-        legacy = _get_legacy_module()
-        if legacy:
-            legacy._autoban_run_once()
+        state = InstallerState.load(STATE_FILE)
+        from installer.diagnostics.health import run_full_health_check
+        run_full_health_check(state.xray.domain, state.server_port)
         return True
 
-    if "--ttl-check" in sys.argv:
+    if "--rollback" in sys.argv:
         _init_quick()
-        legacy = _get_legacy_module()
-        if legacy:
-            removed = legacy._ttl_check_and_expire()
-            if removed:
-                print(f"[TTL] Удалено {removed} пользователей")
+        from installer.core.backup import get_latest_backup, perform_rollback
+        ts = get_latest_backup()
+        if ts:
+            perform_rollback(ts)
+        else:
+            print("Нет доступных бэкапов")
         return True
 
-    if "--dpi-check" in sys.argv:
+    if "--scheduled-backup" in sys.argv:
         _init_quick()
-        legacy = _get_legacy_module()
-        if legacy:
-            n = legacy._dpi_run_once()
-            if n:
-                print(f"[DPI] Заблокировано: {n}")
+        state = InstallerState.load(STATE_FILE)
+        from installer.core.backup import create_scheduled_backup
+        create_scheduled_backup(keep_last=state.scheduled_backup.keep_last)
         return True
 
-    if "--ingress-geoip-update" in sys.argv:
-        _init_quick()
-        legacy = _get_legacy_module()
-        if legacy:
-            state = legacy._ingress_state_load()
-            if state.get("enabled"):
-                port = state.get("port", 443)
-                legacy._ingress_remove()
-                legacy._ingress_enable(port)
-        return True
-
-    if "--tg-event" in sys.argv:
-        _init_quick()
-        legacy = _get_legacy_module()
-        if legacy:
-            idx = sys.argv.index("--tg-event")
-            args = sys.argv[idx + 1: idx + 3]
-            legacy._tg_notify_event(*args)
-        return True
-
-    if "--switch-mode-a" in sys.argv or "--switch-mode-b" in sys.argv:
-        _init_quick()
-        legacy = _get_legacy_module()
-        if legacy:
-            legacy.switch_mode_ab()
-        return True
-
-    if "--update-ru-subnets" in sys.argv:
-        _init_quick()
-        legacy = _get_legacy_module()
-        if legacy:
-            legacy._awg_apply_policy_routing_all_nodes()
-        return True
-
-    if "--pinned-fallback-check" in sys.argv:
-        _init_quick()
-        legacy = _get_legacy_module()
-        if legacy:
-            if not legacy._awg_guard_cron("PinnedFallback"):
-                legacy._pinned_node_check_and_fallback()
-        return True
+    _unimplemented_cron_args = (
+        "--smart-balance", "--autoban", "--ttl-check", "--dpi-check",
+        "--ingress-geoip-update", "--tg-event", "--switch-mode-a",
+        "--switch-mode-b", "--update-ru-subnets", "--pinned-fallback-check",
+    )
+    for arg in _unimplemented_cron_args:
+        if arg in sys.argv:
+            log_to_file("WARN", f"CLI arg {arg!r} not yet implemented in modular version")
+            return True
 
     return False
+
+
+def _do_quick_status() -> None:
+    """Быстрый вывод статуса сервисов для cron/скриптов."""
+    from installer.core.shell import service_is_active
+    from installer.services.xray import get_xray_version
+
+    xray_active  = service_is_active("xray")
+    nginx_active = service_is_active("nginx")
+    xray_ver     = get_xray_version()
+
+    print(f"xray:  {'active' if xray_active else 'inactive'}  {xray_ver}")
+    print(f"nginx: {'active' if nginx_active else 'inactive'}")
 
 
 def _init_quick() -> None:
