@@ -476,39 +476,50 @@ def _restart_services(state: InstallerState) -> None:
 
 def ensure_startup_dependencies(pkg_mgr: str) -> None:
     """
-    Устанавливает базовые зависимости, необходимые для работы установщика:
-    curl, unzip, openssl, dnsutils (dig), jq.
+    Проверяет наличие базовых зависимостей и устанавливает только отсутствующие.
 
+    Для каждой утилиты сначала вызывается shutil.which() — если бинарник
+    уже есть в PATH, пакет не устанавливается повторно.
     Вызывается однократно в начале main.py::run() до первого меню.
     """
     from installer.core.shell import command_exists, run
     from installer.core.system import wait_apt_lock
 
-    needed = []
     checks = {
-        "curl":   "curl",
-        "unzip":  "unzip",
-        "openssl":"openssl",
-        "dig":    "dnsutils",
-        "jq":     "jq",
+        "curl":    "curl",
+        "unzip":   "unzip",
+        "openssl": "openssl",
+        "dig":     "dnsutils",
+        "jq":      "jq",
     }
-    for cmd, pkg in checks.items():
-        if not command_exists(cmd):
-            needed.append(pkg)
 
-    if not needed:
+    missing = {pkg for cmd, pkg in checks.items() if not command_exists(cmd)}
+    present = {pkg for cmd, pkg in checks.items() if command_exists(cmd)}
+
+    if present:
+        log_to_file("INFO", f"Зависимости уже установлены: {', '.join(sorted(present))}")
+
+    if not missing:
+        info("Все базовые зависимости уже установлены")
         return
 
-    info(f"Устанавливаю зависимости: {', '.join(needed)}...")
+    info(f"Отсутствуют: {', '.join(sorted(missing))} — устанавливаю...")
     if pkg_mgr in ("apt-get", "apt"):
         wait_apt_lock()
         run(
-            ["apt-get", "install", "-y", "-q", "--no-install-recommends"] + needed,
+            ["apt-get", "install", "-y", "-q", "--no-install-recommends"] + list(missing),
             env={"DEBIAN_FRONTEND": "noninteractive"},
             check=False, quiet=True,
         )
     elif pkg_mgr == "dnf":
-        run(["dnf", "install", "-y"] + needed, check=False, quiet=True)
+        run(["dnf", "install", "-y"] + list(missing), check=False, quiet=True)
+
+    installed_now = {pkg for cmd, pkg in checks.items() if command_exists(cmd) and pkg in missing}
+    still_missing = missing - installed_now
+    if installed_now:
+        success(f"Установлено: {', '.join(sorted(installed_now))}")
+    if still_missing:
+        warn(f"Не удалось установить: {', '.join(sorted(still_missing))}")
 
 
 def _prompt(msg: str, default: Optional[str] = None) -> str:
