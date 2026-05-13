@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # VLESS Ultimate Installer — bootstrap
-# Использование: bash <(curl -fsSL https://raw.githubusercontent.com/YOUR/REPO/main/bootstrap.sh)
+# Использование: bash <(curl -fsSL https://raw.githubusercontent.com/Greeg0ry/VLESS-Ultimate/master/bootstrap.sh)
 
 set -euo pipefail
 
-REPO_URL="https://github.com/YOUR_USERNAME/VLESS-Ultimate.git"
+REPO_URL="https://github.com/Greeg0ry/VLESS-Ultimate.git"
 INSTALL_DIR="/opt/vless-ultimate"
-BRANCH="main"
+BRANCH="master"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 
