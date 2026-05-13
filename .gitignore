@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Installer runtime — генерируется на сервере, не нужно в репо
+/var/
+/etc/
+/tmp/
+*.log
+*.bak
+*.pre-apply
+
+# State и бэкапы сервера
+state.json
+*.tar.gz
+asn_prefix_cache.sqlite3
+as_direct_*.txt
+as_direct_list.json
+
+# Клиентские конфиги (генерируются при экспорте)
+xray-client-configs/
+clash-meta.yaml
+sing-box.json
+
+# Локальные переопределения bootstrap
+.env
+
